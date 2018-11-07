@@ -74,50 +74,45 @@ class MatchingPredictor(Component):
         for s in sample:
             preproc_sample.append(s.tolist())
 
-        # first, need to append expanded context
-        sent_list = preproc_sample[-(self.num_context_turns + 1):-1]
-        if len(sent_list) <= self.num_context_turns:
-            tmp = sent_list[:]
-            sent_list = [[0]*self.max_sequence_length] * (self.num_context_turns - len(sent_list))
-            sent_list.extend(tmp)
+        sent_list = zero_pad_truncate(preproc_sample, self.max_sequence_length, pad='post', trunc='post')
 
-        # second, adding response sentence
-        sent_list.append(preproc_sample[-1])  # sent_list has shape (num_context_turns+1, max_sequence_length)
-
-        sent_list = zero_pad_truncate(sent_list, self.max_sequence_length, pad='post', trunc='post')
-
-        context_sentences = np.array(sent_list[:self.num_context_turns])
-        response_sentences = np.array(sent_list[self.num_context_turns:])
-
-        # format model inputs
-        # word indices
-        batch_buffer_context += [context_sentences for sent in response_sentences]
-        batch_buffer_response += [response_sentence for response_sentence in response_sentences]
-        # lens of sentences
-        lens = []
-        for context in [context_sentences for sent in response_sentences]:
-            context_sentences_lens = []
-            for sent in context:
-                context_sentences_lens.append(len(sent[sent != 0]))
-            lens.append(context_sentences_lens)
-        batch_buffer_context_len += lens
-
-        lens = []
-        for context in [response_sentence for response_sentence in response_sentences]:
-            lens.append(len(context[context != 0]))
-        batch_buffer_response_len += lens
-
-        feed_dict = {
-            self.model.utterance_ph: np.array(batch_buffer_context),
-            self.model.all_utterance_len_ph: np.array(batch_buffer_context_len),
-            self.model.response_ph: np.array(batch_buffer_response),
-            self.model.response_len_ph: np.array(batch_buffer_response_len)
-        }
-        yp = self.model.sess.run(self.model.y_pred, feed_dict=feed_dict)
-        y_pred = yp[:, 1]
+        # reshape the sample that contains multiple responses to a batch contains n rows like ([context, response1],...)
+        n_responses = len(sent_list[self.num_context_turns:])
+        self.model._append_sample_to_batch(sent_list,
+                                           batch_buffer_context,
+                                           batch_buffer_context_len,
+                                           batch_buffer_response,
+                                           batch_buffer_response_len)
+        if len(batch_buffer_context) >= self.bs:
+            for i in range(len(batch_buffer_context) // self.bs):
+                fd = self.model._make_feed_dict(
+                    input_context=batch_buffer_context[i * self.bs:(i + 1) * self.bs],
+                    input_context_len=batch_buffer_context_len[i * self.bs:(i + 1) * self.bs],
+                    input_response=batch_buffer_response[i * self.bs:(i + 1) * self.bs],
+                    input_response_len=batch_buffer_response_len[i * self.bs:(i + 1) * self.bs]
+                    )
+                yp = self.model.sess.run(self.model.y_pred, feed_dict=fd)
+                y_pred = list(yp[:, 1])
+        lenb = len(batch_buffer_context) % self.bs
+        if lenb != 0:
+            fd = self._make_feed_dict(input_context=batch_buffer_context[-lenb:],
+                                      input_context_len=batch_buffer_context_len[-lenb:],
+                                      input_response=batch_buffer_response[-lenb:],
+                                      input_response_len=batch_buffer_response_len[-lenb:]
+                                      )
+            yp = self.sess.run(self.y_pred, feed_dict=fd)
+            y_pred += list(yp[:, 1])
+        y_pred = np.asarray(y_pred)
+        # reshape to [batch_size, 10] if needed
+        y_pred = np.reshape(y_pred, (1, n_responses)) if n_responses > 1 else y_pred
 
         # return ["The probability that the response is proper continuation of the dialog is {:.3f}".format(y_pred[0])]
-        return ["{:.5f}".format(y_pred[0])]
+        # return ["{:.5f}".format(y_pred[0])]
+        vector = y_pred[0]
+        str_vector = []
+        for i in vector:
+            str_vector.append("{:.5f}".format(i))
+        return str_vector
 
     def reset(self) -> None:
         pass
